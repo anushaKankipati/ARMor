@@ -1,2 +1,2 @@
 # ARMor
-Senior Design
+Anusha, Akshay, Afra, Lucas
