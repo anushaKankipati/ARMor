@@ -1,1 +1,16 @@
-3
+PersonID, Name, Age, Country, DepartmentID
+1, Alice Smith, 29, USA, 101
+2, Bob Johnson, 35, USA, 102
+3, Charlie Lee, 28, Canada, 101
+4, Diana Evans, 40, UK, 103
+5, Emily Chen, 30, Canada, 102
+
+DepartmentID, DepartmentName, ManagerID
+101, Sales, 10
+102, Marketing, 11
+103, Engineering, 12
+
+ManagerID, ManagerName, Country
+10, Lisa Brown, USA
+11, Mark White, Canada
+12, Sarah Davis, UK
