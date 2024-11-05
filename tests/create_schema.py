@@ -162,8 +162,12 @@ class DataModeler:
             # Enable foreign key support
             cursor.execute("PRAGMA foreign_keys = ON;")
             
-            # Create tables
+            # Create tables with proper constraints
             for table_name, table_info in analysis['schema'].items():
+                # Drop table if exists
+                cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                
+                # Create table with constraints
                 columns = []
                 for col in table_info['columns']:
                     column_def = f"{col['name']} {col['type']}"
@@ -171,29 +175,33 @@ class DataModeler:
                         column_def += f" {' '.join(col['constraints'])}"
                     columns.append(column_def)
                 
+                # Add foreign key constraints directly in CREATE TABLE
+                for source, target in analysis['relationships']:
+                    source_table, source_col = source.split('.')
+                    target_table, target_col = target.split('.')
+                    if source_table == table_name:
+                        constraint_name = f"fk_{source_table}_{source_col}"
+                        fk_constraint = (
+                            f"CONSTRAINT {constraint_name} "
+                            f"FOREIGN KEY ({source_col}) "
+                            f"REFERENCES {target_table}({target_col})"
+                        )
+                        columns.append(fk_constraint)
+                
                 create_table_sql = f"CREATE TABLE {table_name} ({', '.join(columns)});"
                 cursor.execute(create_table_sql)
                 
-                # Insert data
+                # Insert data using SQL instead of pandas to_sql
                 df = self.tables[table_name]
-                df.to_sql(table_name, self.db_connection, 
-                         if_exists='replace', index=False)
-            
-            # Add foreign key constraints
-            for source, target in analysis['relationships']:
-                source_table, source_col = source.split('.')
-                target_table, target_col = target.split('.')
-                constraint_name = f"fk_{source_table}_{source_col}"
-                
-                try:
-                    alter_table_sql = (
-                        f"ALTER TABLE {source_table} "
-                        f"ADD CONSTRAINT {constraint_name} "
-                        f"FOREIGN KEY ({source_col}) REFERENCES {target_table}({target_col})"
-                    )
-                    cursor.execute(alter_table_sql)
-                except sqlite3.OperationalError as e:
-                    print(f"Warning: Could not add foreign key constraint {constraint_name}: {str(e)}")
+                for _, row in df.iterrows():
+                    # Filter out None/NaN values and prepare column names and values
+                    valid_columns = [col for col in df.columns if pd.notna(row[col])]
+                    placeholders = ','.join(['?' for _ in valid_columns])
+                    columns_str = ','.join(valid_columns)
+                    values = [row[col] for col in valid_columns]
+                    
+                    insert_sql = f"INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})"
+                    cursor.execute(insert_sql, values)
             
             self.db_connection.commit()
             
