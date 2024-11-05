@@ -1,128 +1,234 @@
-#anusha gpt response
-
-import csv
-import json
-import xmltodict
+#anusha claude response
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Set, Tuple
 import sqlite3
-import difflib
-from collections import defaultdict
+import io
+import sys
 
-
-
-def convert_xml_to_dict(data):
-    """Recursively converts an XML structure (parsed by xmltodict) into a standard dictionary."""
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if isinstance(value, list):
-                data[key] = [convert_xml_to_dict(item) for item in value]
-            elif isinstance(value, dict):
-                data[key] = convert_xml_to_dict(value)
-    return data
-
-def read_file(file_path):
-    """Detects file type and reads data accordingly."""
-    if file_path.endswith('.csv') or file_path.endswith('.tsv'):
-        delimiter = ',' if file_path.endswith('.csv') else '\t'
-        with open(file_path, 'r') as file:
-            reader = csv.DictReader(file, delimiter=delimiter)
-            data = [row for row in reader]
-    elif file_path.endswith('.json'):
-        with open(file_path, 'r') as file:
-            data = json.load(file)
-    elif file_path.endswith('.xml'):
-        with open(file_path, 'r') as file:
-            data = xmltodict.parse(file.read())
-            data = convert_xml_to_dict(data)
-    else:
-        raise ValueError("Unsupported file format.")
-    return data
-
-def clean_data(data):
-    """Correct typos, remove duplicates, and standardize data."""
-    cleaned_data = []
-    seen_rows = set()
-    
-    for row in data:
-        # Standardize data: lower case and strip whitespace, handle None values
-        cleaned_row = {k.lower().strip(): (v.lower().strip() if isinstance(v, str) else v) for k, v in row.items()}
-        row_tuple = tuple(cleaned_row.items())
+class DataModeler:
+    def __init__(self):
+        self.tables = {}
+        self.relationships = []
+        self.db_connection = None
         
-        # Remove duplicates and correct typos
-        if row_tuple not in seen_rows:
-            seen_rows.add(row_tuple)
-            for k, v in cleaned_row.items():
-                if isinstance(v, str):  # Only attempt typo correction on strings
-                    corrected_value = difflib.get_close_matches(v, seen_rows, n=1)
-                    cleaned_row[k] = corrected_value[0] if corrected_value else v
-            cleaned_data.append(cleaned_row)
+    def load_multi_table_csv(self, file_path: str) -> None:
+        """Load a CSV file containing multiple tables separated by blank lines."""
+        try:
+            with open(file_path, 'r') as file:
+                content = file.read()
+            
+            # Split the content into separate tables
+            table_blocks = [block.strip() for block in content.split('\n\n') if block.strip()]
+            
+            for block in table_blocks:
+                # Convert block to StringIO to use with pandas
+                block_io = io.StringIO(block)
+                # Read the data, handling spaces after commas
+                df = pd.read_csv(block_io, skipinitialspace=True)
+                
+                # Determine table name from the ID column
+                id_columns = [col for col in df.columns if col.endswith('ID')]
+                if not id_columns:
+                    raise ValueError(f"No ID column found in table with columns: {df.columns}")
+                
+                # Use the first ID column to name the table
+                table_name = id_columns[0].replace('ID', 's')
+                self.tables[table_name] = df
+                
+            if not self.tables:
+                raise ValueError("No valid tables found in the CSV file")
+            
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Could not find CSV file: {file_path}")
+        except pd.errors.EmptyDataError:
+            raise ValueError("The CSV file is empty")
+        except Exception as e:
+            raise Exception(f"Error loading CSV file: {str(e)}")
     
-    return cleaned_data
-
-
-def infer_relationships(data):
-    """Infer relationships, primary keys, and foreign keys."""
-    columns = data[0].keys()
-    potential_keys = {}
-    relationships = defaultdict(list)
-
-    for col in columns:
-        unique_vals = {row[col] for row in data if row[col]}
-        if len(unique_vals) == len(data):
-            potential_keys[col] = 'primary key'
+    def _identify_primary_key(self, df: pd.DataFrame) -> str:
+        """Identify primary key based on ID column and uniqueness."""
+        # First try to find an ID column that's unique
+        id_columns = [col for col in df.columns if col.endswith('ID')]
+        for col in id_columns:
+            if df[col].nunique() == len(df):
+                return col
+        
+        # If no suitable ID column found, return None
+        return None
+    
+    def _identify_foreign_keys(self, source_df: pd.DataFrame, target_df: pd.DataFrame, 
+                             source_table: str, target_table: str) -> List[Tuple[str, str]]:
+        """Identify potential foreign key relationships between tables."""
+        relationships = []
+        target_id_columns = [col for col in target_df.columns if col.endswith('ID')]
+        
+        for source_col in source_df.columns:
+            if source_col.endswith('ID'):
+                source_values = set(source_df[source_col].dropna().unique())
+                
+                for target_col in target_id_columns:
+                    target_values = set(target_df[target_col].dropna().unique())
+                    
+                    # Check if source values are subset of target values
+                    if (source_values and target_values and 
+                        source_values.issubset(target_values) and
+                        source_col != target_col):  # Avoid self-referential keys
+                        relationships.append((
+                            f"{source_table}.{source_col}",
+                            f"{target_table}.{target_col}"
+                        ))
+        
+        return relationships
+    
+    def _infer_data_type(self, series: pd.Series) -> str:
+        """Infer SQL data type from pandas series."""
+        dtype = series.dtype
+        if pd.api.types.is_integer_dtype(dtype):
+            return 'INTEGER'
+        elif pd.api.types.is_float_dtype(dtype):
+            return 'REAL'
+        elif pd.api.types.is_bool_dtype(dtype):
+            return 'INTEGER'  # SQLite doesn't have boolean
+        elif pd.api.types.is_datetime64_any_dtype(dtype):
+            return 'TEXT'  # Store datetime as TEXT in SQLite
         else:
-            relationships[col] = unique_vals
+            return 'TEXT'  # Default to TEXT for strings and other types
     
-    # Infer foreign keys by looking for columns with similar values
-    for col, values in relationships.items():
-        for other_col, other_values in relationships.items():
-            if col != other_col and values & other_values:
-                relationships[col].append(other_col)
+    def analyze(self) -> Dict:
+        """Analyze loaded tables and infer relationships."""
+        schema = {}
+        self.relationships = []
+        
+        # First pass: identify primary keys and data types
+        for table_name, df in self.tables.items():
+            primary_key = self._identify_primary_key(df)
+            columns = []
+            
+            if primary_key is None:
+                primary_key = 'id'
+                columns.append({
+                    'name': primary_key,
+                    'type': 'INTEGER',
+                    'constraints': ['PRIMARY KEY AUTOINCREMENT']
+                })
+            else:
+                columns.append({
+                    'name': primary_key,
+                    'type': 'INTEGER',
+                    'constraints': ['PRIMARY KEY']
+                })
+            
+            # Add remaining columns
+            for column in df.columns:
+                if column != primary_key:
+                    data_type = self._infer_data_type(df[column])
+                    constraints = []
+                    if df[column].notna().all():
+                        constraints.append('NOT NULL')
+                    
+                    columns.append({
+                        'name': column,
+                        'type': data_type,
+                        'constraints': constraints
+                    })
+            
+            schema[table_name] = {
+                'columns': columns,
+                'primary_key': primary_key
+            }
+        
+        # Second pass: identify foreign key relationships
+        for source_table, source_df in self.tables.items():
+            for target_table, target_df in self.tables.items():
+                if source_table != target_table:
+                    relationships = self._identify_foreign_keys(
+                        source_df, target_df, source_table, target_table
+                    )
+                    self.relationships.extend(relationships)
+        
+        return {
+            'schema': schema,
+            'relationships': self.relationships
+        }
     
-    return potential_keys, relationships
+    def create_database(self, db_path: str, analysis: Dict) -> None:
+        """Create SQLite database file and populate it with the data."""
+        try:
+            # Create or connect to SQLite database
+            self.db_connection = sqlite3.connect(db_path)
+            cursor = self.db_connection.cursor()
+            
+            # Enable foreign key support
+            cursor.execute("PRAGMA foreign_keys = ON;")
+            
+            # Create tables
+            for table_name, table_info in analysis['schema'].items():
+                columns = []
+                for col in table_info['columns']:
+                    column_def = f"{col['name']} {col['type']}"
+                    if col['constraints']:
+                        column_def += f" {' '.join(col['constraints'])}"
+                    columns.append(column_def)
+                
+                create_table_sql = f"CREATE TABLE {table_name} ({', '.join(columns)});"
+                cursor.execute(create_table_sql)
+                
+                # Insert data
+                df = self.tables[table_name]
+                df.to_sql(table_name, self.db_connection, 
+                         if_exists='replace', index=False)
+            
+            # Add foreign key constraints
+            for source, target in analysis['relationships']:
+                source_table, source_col = source.split('.')
+                target_table, target_col = target.split('.')
+                constraint_name = f"fk_{source_table}_{source_col}"
+                
+                try:
+                    alter_table_sql = (
+                        f"ALTER TABLE {source_table} "
+                        f"ADD CONSTRAINT {constraint_name} "
+                        f"FOREIGN KEY ({source_col}) REFERENCES {target_table}({target_col})"
+                    )
+                    cursor.execute(alter_table_sql)
+                except sqlite3.OperationalError as e:
+                    print(f"Warning: Could not add foreign key constraint {constraint_name}: {str(e)}")
+            
+            self.db_connection.commit()
+            
+        except Exception as e:
+            if self.db_connection:
+                self.db_connection.rollback()
+            raise Exception(f"Error creating database: {str(e)}")
+        
+        finally:
+            if self.db_connection:
+                self.db_connection.close()
 
-def create_sql_schema(data, potential_keys, relationships):
-    """Generate SQL schema based on inferred keys and relationships."""
-    conn = sqlite3.connect('normalized_data.db')
-    cursor = conn.cursor()
+if __name__ == "__main__":
+    # Create modeler instance
+    modeler = DataModeler()
     
-    table_name = 'main_table'
-    columns = ', '.join([f"{col} TEXT" for col in data[0].keys()])
-    primary_keys = ', '.join([k for k, v in potential_keys.items() if v == 'primary key'])
+    # Load and process the CSV file
+    print("Loading CSV file...")
+    modeler.load_multi_table_csv('ex.csv')  # Replace with your CSV filename
     
-    cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} ({columns}, PRIMARY KEY ({primary_keys}))")
-    conn.commit()
+    # Analyze the data
+    print("Analyzing data and inferring relationships...")
+    analysis = modeler.analyze()
     
-    # Insert data into SQL tables
-    placeholders = ', '.join('?' * len(data[0].keys()))
-    for row in data:
-        cursor.execute(f"INSERT OR IGNORE INTO {table_name} VALUES ({placeholders})", tuple(row.values()))
+    # Create the database
+    print("Creating database file...")
+    modeler.create_database('output.db', analysis)  # This will create output.db
     
-    conn.commit()
-    conn.close()
-
-def main(file_path):
-    data = read_file(file_path)
-    cleaned_data = clean_data(data)
-    potential_keys, relationships = infer_relationships(cleaned_data)
-    create_sql_schema(cleaned_data, potential_keys, relationships)
-    print("Data normalized and stored in 'normalized_data.db'")
-
-# Example Usage
-file_path = 'ex.csv'  # Replace with your file path
-main(file_path)
-
-conn = sqlite3.connect('normalized_data.db')
-cursor = conn.cursor()
-
-# List all tables
-cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-tables = cursor.fetchall()
-print("Tables:", tables)
-
-# View data in a specific table (replace 'table_name' with the actual name)
-cursor.execute("SELECT * FROM usa_table;")
-rows = cursor.fetchall()
-for row in rows:
-    print(row)
-
-conn.close()
+    print("Database created successfully!")
+    
+    # Print summary of what was created
+    print("\nCreated tables:")
+    for table_name in analysis['schema'].keys():
+        print(f"- {table_name}")
+    
+    print("\nIdentified relationships:")
+    for source, target in analysis['relationships']:
+        print(f"- {source} -> {target}")
